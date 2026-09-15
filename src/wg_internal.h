@@ -1,3 +1,8 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later
+ * Copyright (c) 2026 xlanor
+ * This file is part of wg-nx. See COPYING and COPYING.LESSER.
+ */
+
 #ifndef WG_INTERNAL_H
 #define WG_INTERNAL_H
 
@@ -125,6 +130,7 @@ struct WgTunnel {
     struct in_addr tunnel_ip;
     struct sockaddr_in endpoint;
     uint16_t keepalive_interval;
+    uint16_t mtu;
     int socket_fd;
     WgSession session;
     WgSession prev_session;

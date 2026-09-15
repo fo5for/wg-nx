@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Copyright (c) 2026 xlanor
+
 FROM devkitpro/devkita64:latest
 
 RUN dkp-pacman -Syu --noconfirm && \

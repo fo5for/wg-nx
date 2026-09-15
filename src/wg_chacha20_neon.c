@@ -1,3 +1,8 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later
+ * Copyright (c) 2026 xlanor
+ * This file is part of wg-nx. See COPYING and COPYING.LESSER.
+ */
+
 #include "wg_chacha20_neon.h"
 #include "wg_poly1305_neon.h"
 #include "monocypher.h"
@@ -16,6 +21,11 @@
 #define CHACHA20_CONSTANTS_2 0x79622d32
 #define CHACHA20_CONSTANTS_3 0x6b206574
 
+/* Set to 0 in benchmark builds to compare against the previous serial path. */
+#ifndef WG_CHACHA20_4BLOCK
+#define WG_CHACHA20_4BLOCK 1
+#endif
+
 static inline uint32_t load32_le(const uint8_t *p) {
     return (uint32_t)p[0] |
            ((uint32_t)p[1] << 8) |
@@ -32,9 +42,7 @@ static inline void store32_le(uint8_t *p, uint32_t v) {
 
 #if HAS_NEON
 
-static inline uint32x4_t rotl_neon(uint32x4_t x, int n) {
-    return vorrq_u32(vshlq_n_u32(x, n), vshrq_n_u32(x, 32 - n));
-}
+#define ROTL_NEON(x, n) vorrq_u32(vshlq_n_u32((x), (n)), vshrq_n_u32((x), 32 - (n)))
 
 #define ROTL16(x) vreinterpretq_u32_u16(vrev32q_u16(vreinterpretq_u16_u32(x)))
 
@@ -46,15 +54,15 @@ static inline void quarterround_neon(uint32x4_t *a, uint32x4_t *b,
 
     *c = vaddq_u32(*c, *d);
     *b = veorq_u32(*b, *c);
-    *b = rotl_neon(*b, 12);
+    *b = ROTL_NEON(*b, 12);
 
     *a = vaddq_u32(*a, *b);
     *d = veorq_u32(*d, *a);
-    *d = rotl_neon(*d, 8);
+    *d = ROTL_NEON(*d, 8);
 
     *c = vaddq_u32(*c, *d);
     *b = veorq_u32(*b, *c);
-    *b = rotl_neon(*b, 7);
+    *b = ROTL_NEON(*b, 7);
 }
 
 static void chacha20_block_neon_internal(uint32_t out[16], const uint32_t in[16]) {
@@ -92,6 +100,55 @@ static void chacha20_block_neon_internal(uint32_t out[16], const uint32_t in[16]
     vst1q_u32(&out[8], row2);
     vst1q_u32(&out[12], row3);
 }
+
+#if WG_CHACHA20_4BLOCK
+/* Each NEON lane holds one independent ChaCha block. This avoids waiting to
+ * gather separate WireGuard packets and works for the common 256+ byte payload. */
+static void chacha20_4block_neon_xor(uint8_t *out, const uint8_t *in,
+                                     const uint32_t state[16], uint32_t counter) {
+    uint32x4_t x[16];
+    const uint32_t counters[4] = {counter, counter + 1, counter + 2, counter + 3};
+    const uint32x4_t counter_vec = vld1q_u32(counters);
+
+    for (int i = 0; i < 16; ++i) x[i] = vdupq_n_u32(state[i]);
+    x[12] = counter_vec;
+
+    for (int i = 0; i < 10; ++i) {
+        quarterround_neon(&x[0], &x[4], &x[8], &x[12]);
+        quarterround_neon(&x[1], &x[5], &x[9], &x[13]);
+        quarterround_neon(&x[2], &x[6], &x[10], &x[14]);
+        quarterround_neon(&x[3], &x[7], &x[11], &x[15]);
+
+        quarterround_neon(&x[0], &x[5], &x[10], &x[15]);
+        quarterround_neon(&x[1], &x[6], &x[11], &x[12]);
+        quarterround_neon(&x[2], &x[7], &x[8], &x[13]);
+        quarterround_neon(&x[3], &x[4], &x[9], &x[14]);
+    }
+
+    for (int i = 0; i < 16; ++i) {
+        x[i] = vaddq_u32(x[i], i == 12 ? counter_vec : vdupq_n_u32(state[i]));
+    }
+
+    /* Transpose groups of four words from block-parallel lanes to the
+     * contiguous 16-byte chunks expected by each packet. */
+    for (int word = 0; word < 16; word += 4) {
+        uint32x4x2_t ab = vtrnq_u32(x[word], x[word + 1]);
+        uint32x4x2_t cd = vtrnq_u32(x[word + 2], x[word + 3]);
+        uint32x4_t blocks[4] = {
+            vcombine_u32(vget_low_u32(ab.val[0]), vget_low_u32(cd.val[0])),
+            vcombine_u32(vget_low_u32(ab.val[1]), vget_low_u32(cd.val[1])),
+            vcombine_u32(vget_high_u32(ab.val[0]), vget_high_u32(cd.val[0])),
+            vcombine_u32(vget_high_u32(ab.val[1]), vget_high_u32(cd.val[1]))
+        };
+        for (int lane = 0; lane < 4; ++lane) {
+            size_t offset = (size_t)lane * 64 + (size_t)word * 4;
+            uint8x16_t data = vld1q_u8(in + offset);
+            uint8x16_t stream = vreinterpretq_u8_u32(blocks[lane]);
+            vst1q_u8(out + offset, veorq_u8(data, stream));
+        }
+    }
+}
+#endif
 
 void wg_chacha20_block_neon(uint8_t out[64], const uint8_t key[32],
                             const uint8_t nonce[12], uint32_t counter) {
@@ -145,18 +202,26 @@ void wg_chacha20_neon(uint8_t *out, const uint8_t *in, size_t len,
     state[14] = load32_le(nonce + 4);
     state[15] = load32_le(nonce + 8);
 
+#if WG_CHACHA20_4BLOCK
+    while (len >= 256) {
+        chacha20_4block_neon_xor(out, in, state, counter);
+        counter += 4;
+        out += 256;
+        in += 256;
+        len -= 256;
+    }
+#endif
+
     while (len >= 64) {
         state[12] = counter++;
         chacha20_block_neon_internal(block, state);
 
-        uint32x4_t *out32 = (uint32x4_t *)out;
-        uint32x4_t *in32 = (uint32x4_t *)in;
-        uint32x4_t *blk32 = (uint32x4_t *)block;
-
-        vst1q_u32((uint32_t *)out32, veorq_u32(vld1q_u32((uint32_t *)in32), vld1q_u32((uint32_t *)blk32)));
-        vst1q_u32((uint32_t *)(out32 + 1), veorq_u32(vld1q_u32((uint32_t *)(in32 + 1)), vld1q_u32((uint32_t *)(blk32 + 1))));
-        vst1q_u32((uint32_t *)(out32 + 2), veorq_u32(vld1q_u32((uint32_t *)(in32 + 2)), vld1q_u32((uint32_t *)(blk32 + 2))));
-        vst1q_u32((uint32_t *)(out32 + 3), veorq_u32(vld1q_u32((uint32_t *)(in32 + 3)), vld1q_u32((uint32_t *)(blk32 + 3))));
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            size_t offset = (size_t)chunk * 16;
+            uint8x16_t data = vld1q_u8(in + offset);
+            uint8x16_t stream = vld1q_u8((const uint8_t *)block + offset);
+            vst1q_u8(out + offset, veorq_u8(data, stream));
+        }
 
         out += 64;
         in += 64;

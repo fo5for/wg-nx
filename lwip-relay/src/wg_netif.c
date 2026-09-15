@@ -1,9 +1,12 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later
+ * Copyright (c) 2026 xlanor
+ * This file is part of wg-nx. See COPYING and COPYING.LESSER.
+ */
+
 #include "wg_netif.h"
 #include "lwip/pbuf.h"
 #include "lwip/ip.h"
 #include <string.h>
-
-#define WG_MTU 1420
 
 static err_t wg_netif_output(struct netif *netif, struct pbuf *p, const ip4_addr_t *ipaddr) {
     (void)ipaddr;
@@ -12,9 +15,13 @@ static err_t wg_netif_output(struct netif *netif, struct pbuf *p, const ip4_addr
         return ERR_IF;
     }
 
-    uint8_t buf[1500];
+    if (p->tot_len > netif->mtu || p->tot_len > WG_MAX_MTU) {
+        return ERR_BUF;
+    }
+
+    uint8_t buf[WG_MAX_MTU];
     u16_t len = pbuf_copy_partial(p, buf, sizeof(buf), 0);
-    if (len == 0) {
+    if (len == 0 || len != p->tot_len) {
         return ERR_BUF;
     }
 
@@ -30,7 +37,8 @@ err_t wg_netif_init(struct netif *netif) {
     netif->name[0] = 'w';
     netif->name[1] = 'g';
     netif->output = wg_netif_output;
-    netif->mtu = WG_MTU;
+    uint16_t mtu = wg_get_mtu((WgTunnel *)netif->state);
+    netif->mtu = mtu ? mtu : WG_DEFAULT_MTU;
     netif->flags = NETIF_FLAG_UP | NETIF_FLAG_LINK_UP;
     return ERR_OK;
 }

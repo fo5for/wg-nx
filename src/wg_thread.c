@@ -1,3 +1,8 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later
+ * Copyright (c) 2026 xlanor
+ * This file is part of wg-nx. See COPYING and COPYING.LESSER.
+ */
+
 #define _GNU_SOURCE
 
 #include "wg_thread.h"

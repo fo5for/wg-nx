@@ -1,3 +1,8 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later
+ * Copyright (c) 2026 xlanor
+ * This file is part of wg-nx. See COPYING and COPYING.LESSER.
+ */
+
 #pragma once
 
 #include <string>
@@ -10,6 +15,7 @@
 #include <queue>
 #include <array>
 #include <functional>
+#include <cstdint>
 
 extern "C" {
 #include "lwip/tcp.h"
@@ -78,12 +84,14 @@ private:
     };
 
     void log(LogLevel level, const char* fmt, ...);
+    void flushDebugTraffic();
 
     void runLoop();
     void pollTcpListeners();
     void pollUdpSockets();
     void pollTcpConnections();
     void signalWake();
+    short pollRevents(int fd) const;
 
     int createTcpListener(uint16_t port);
     int createUdpSocket(uint16_t port);
@@ -126,6 +134,11 @@ private:
 
     int wakeFd_[2] = {-1, -1};
     std::vector<pollfd> pollFds_;
+
+    uint64_t debugTcpPackets_ = 0;
+    uint64_t debugTcpBytes_ = 0;
+    uint64_t debugUdpPackets_ = 0;
+    uint64_t debugUdpBytes_ = 0;
 
     bool initialized_;
 };

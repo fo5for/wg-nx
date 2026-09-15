@@ -1,3 +1,8 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later
+ * Copyright (c) 2026 xlanor
+ * This file is part of wg-nx. See COPYING and COPYING.LESSER.
+ */
+
 #include "wg_lwip_relay.hpp"
 #include "wg_netif.h"
 #include <cstring>
@@ -8,6 +13,8 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <climits>
+#include <chrono>
 
 extern "C" {
 #include "lwip/init.h"
@@ -55,6 +62,21 @@ void LwipRelay::log(LogLevel level, const char* fmt, ...) {
     config_.log_callback(level, buf);
 }
 
+void LwipRelay::flushDebugTraffic() {
+    if (!config_.debug_logging ||
+        (debugTcpPackets_ == 0 && debugUdpPackets_ == 0)) {
+        return;
+    }
+    log(LogLevel::Debug,
+        "LwipRelay: outbound summary TCP=%llu packets/%llu bytes, UDP=%llu packets/%llu bytes",
+        static_cast<unsigned long long>(debugTcpPackets_),
+        static_cast<unsigned long long>(debugTcpBytes_),
+        static_cast<unsigned long long>(debugUdpPackets_),
+        static_cast<unsigned long long>(debugUdpBytes_));
+    debugTcpPackets_ = debugTcpBytes_ = 0;
+    debugUdpPackets_ = debugUdpBytes_ = 0;
+}
+
 bool LwipRelay::start(const std::string& tunnelIp, const std::string& targetIp) {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -85,7 +107,7 @@ bool LwipRelay::start(const std::string& tunnelIp, const std::string& targetIp) 
     netif_set_default(&netif_);
     netif_set_up(&netif_);
 
-    log(LogLevel::Info, "LwipRelay: netif created with IP %s", tunnelIp.c_str());
+    log(LogLevel::Info, "LwipRelay: netif created with IP %s, MTU %u", tunnelIp.c_str(), netif_.mtu);
 
     /* Self-pipe via a connected loopback UDP pair — libnx's BSD sockets
      * don't implement AF_UNIX, so socketpair() is unavailable here. */
@@ -178,6 +200,7 @@ void LwipRelay::stop() {
     for (auto& pair : tcpConnections_) {
         if (pair.second->localSock >= 0) {
             close(pair.second->localSock);
+            pair.second->localSock = -1;
         }
         if (pair.second->pcb) {
             tcp_abort(pair.second->pcb);
@@ -328,12 +351,7 @@ void LwipRelay::runLoop() {
     }
 
     log(LogLevel::Info, "LwipRelay: loop started");
-
-    /* Event-driven: block in a single poll() watching the wake pipe and all
-     * managed sockets. The 200ms timeout bounds lwIP timer accuracy, still
-     * well within TCP's 500ms retransmit floor, and halves idle wake-up
-     * syscalls vs the previous 50ms. */
-    constexpr int kPollTimeoutMs = 200;
+    auto lastTrafficLog = std::chrono::steady_clock::now();
 
     while (running_) {
         pollFds_.clear();
@@ -345,7 +363,7 @@ void LwipRelay::runLoop() {
                 pollFds_.push_back({pair.second, POLLIN, 0});
             }
             for (auto& pair : tcpConnections_) {
-                if (pair.second->connected) {
+                if (pair.second->connected && pair.second->localSock >= 0) {
                     pollFds_.push_back({pair.first, POLLIN, 0});
                 }
             }
@@ -354,12 +372,34 @@ void LwipRelay::runLoop() {
             }
         }
 
-        poll(pollFds_.data(), pollFds_.size(), kPollTimeoutMs);
+        /* BSD poll is the reactor wait. Use lwIP's actual next deadline rather
+         * than periodically waking just to check its timers. */
+        u32_t sleepMs = sys_timeouts_sleeptime();
+        int timeoutMs = sleepMs == SYS_TIMEOUTS_SLEEPTIME_INFINITE
+            ? -1
+            : static_cast<int>(std::min<u32_t>(sleepMs, INT_MAX));
+
+        int ready = poll(pollFds_.data(), pollFds_.size(), timeoutMs);
 
         if (!running_) break;
 
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            log(LogLevel::Error, "LwipRelay: poll failed: errno=%d", errno);
+            running_ = false;
+            break;
+        }
+
+        short wakeEvents = pollFds_[0].revents;
+        if (wakeEvents & (POLLERR | POLLHUP | POLLNVAL)) {
+            log(LogLevel::Error, "LwipRelay: wake socket failed: revents=0x%x",
+                static_cast<unsigned>(wakeEvents));
+            running_ = false;
+            break;
+        }
+
         /* Drain any queued wake bytes. */
-        if (pollFds_[0].revents & POLLIN) {
+        if (wakeEvents & POLLIN) {
             char buf[64];
             while (read(wakeFd_[0], buf, sizeof(buf)) > 0) {}
         }
@@ -372,23 +412,42 @@ void LwipRelay::runLoop() {
             pollUdpSockets();
             sys_check_timeouts();
         }
+
+        auto now = std::chrono::steady_clock::now();
+        if (config_.debug_logging &&
+            now - lastTrafficLog >= std::chrono::seconds(5)) {
+            flushDebugTraffic();
+            lastTrafficLog = now;
+        }
     }
 
+    flushDebugTraffic();
     log(LogLevel::Info, "LwipRelay: loop ended");
 }
 
+short LwipRelay::pollRevents(int fd) const {
+    for (const auto& pfd : pollFds_) {
+        if (pfd.fd == fd) return pfd.revents;
+    }
+    return 0;
+}
+
 void LwipRelay::pollTcpListeners() {
+    std::vector<uint16_t> toRemove;
+
     for (auto& pair : tcpListeners_) {
         uint16_t localPort = pair.first;
         int listenSock = pair.second;
 
-        pollfd pfd;
-        pfd.fd = listenSock;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-
-        int ret = poll(&pfd, 1, 0);
-        if (ret <= 0 || !(pfd.revents & POLLIN)) {
+        short revents = pollRevents(listenSock);
+        if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            log(LogLevel::Error,
+                "LwipRelay: TCP listener %u failed: revents=0x%x",
+                localPort, static_cast<unsigned>(revents));
+            toRemove.push_back(localPort);
+            continue;
+        }
+        if (!(revents & POLLIN)) {
             continue;
         }
 
@@ -428,9 +487,18 @@ void LwipRelay::pollTcpListeners() {
         err_t err = tcp_connect(pcb, &destAddr, localPort, onTcpConnected);
         if (err != ERR_OK) {
             log(LogLevel::Error, "LwipRelay: tcp_connect failed: %d", (int)err);
-            tcp_abort(pcb);
             close(clientSock);
+            conn->localSock = -1;
+            tcp_abort(pcb);
             tcpConnections_.erase(clientSock);
+        }
+    }
+
+    for (uint16_t port : toRemove) {
+        auto it = tcpListeners_.find(port);
+        if (it != tcpListeners_.end()) {
+            close(it->second);
+            tcpListeners_.erase(it);
         }
     }
 }
@@ -442,22 +510,20 @@ void LwipRelay::pollTcpConnections() {
         int sock = pair.first;
         auto& conn = pair.second;
 
-        if (!conn->connected) {
-            continue;
-        }
-
-        pollfd pfd;
-        pfd.fd = sock;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-
-        int ret = poll(&pfd, 1, 0);
-        if (ret < 0) {
+        /* lwIP callbacks mark remotely closed connections this way. Remove
+         * them before their stale map key can enter the next poll set. */
+        if (conn->localSock < 0) {
             toRemove.push_back(sock);
             continue;
         }
 
-        if (ret > 0 && (pfd.revents & POLLIN)) {
+        if (!conn->connected) {
+            continue;
+        }
+
+        short revents = pollRevents(sock);
+
+        if (revents & POLLIN) {
             uint8_t buf[2048];
             ssize_t received = recv(sock, buf, sizeof(buf), 0);
 
@@ -477,14 +543,17 @@ void LwipRelay::pollTcpConnections() {
                 err_t err = tcp_write(conn->pcb, buf, (u16_t)received, TCP_WRITE_FLAG_COPY);
                 if (err == ERR_OK) {
                     tcp_output(conn->pcb);
-                    log(LogLevel::Debug, "LwipRelay: sent %zd bytes to target", received);
+                    if (config_.debug_logging) {
+                        debugTcpPackets_++;
+                        debugTcpBytes_ += static_cast<uint64_t>(received);
+                    }
                 } else {
                     log(LogLevel::Error, "LwipRelay: tcp_write failed: %d", (int)err);
                 }
             }
         }
 
-        if (pfd.revents & (POLLERR | POLLHUP)) {
+        if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
             toRemove.push_back(sock);
         }
     }
@@ -494,6 +563,7 @@ void LwipRelay::pollTcpConnections() {
         if (it != tcpConnections_.end()) {
             if (it->second->localSock >= 0) {
                 close(it->second->localSock);
+                it->second->localSock = -1;
             }
             if (it->second->pcb) {
                 tcp_abort(it->second->pcb);
@@ -504,16 +574,21 @@ void LwipRelay::pollTcpConnections() {
 }
 
 void LwipRelay::pollUdpSockets() {
+    std::vector<uint16_t> toRemove;
+
     for (auto& pair : udpBindings_) {
+        uint16_t localPort = pair.first;
         auto& binding = pair.second;
 
-        pollfd pfd;
-        pfd.fd = binding->localSock;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-
-        int ret = poll(&pfd, 1, 0);
-        if (ret <= 0 || !(pfd.revents & POLLIN)) {
+        short revents = pollRevents(binding->localSock);
+        if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            log(LogLevel::Error,
+                "LwipRelay: UDP socket %u failed: revents=0x%x",
+                localPort, static_cast<unsigned>(revents));
+            toRemove.push_back(localPort);
+            continue;
+        }
+        if (!(revents & POLLIN)) {
             continue;
         }
 
@@ -543,7 +618,18 @@ void LwipRelay::pollUdpSockets() {
         udp_sendto(binding->pcb, p, &destAddr, binding->targetPort);
         pbuf_free(p);
 
-        log(LogLevel::Debug, "LwipRelay: sent %zd UDP bytes to target port %u", received, binding->targetPort);
+        if (config_.debug_logging) {
+            debugUdpPackets_++;
+            debugUdpBytes_ += static_cast<uint64_t>(received);
+        }
+    }
+
+    for (uint16_t port : toRemove) {
+        auto it = udpBindings_.find(port);
+        if (it == udpBindings_.end()) continue;
+        if (it->second->localSock >= 0) close(it->second->localSock);
+        if (it->second->pcb) udp_remove(it->second->pcb);
+        udpBindings_.erase(it);
     }
 }
 
@@ -636,6 +722,7 @@ err_t LwipRelay::onTcpRecv(void* arg, struct tcp_pcb* pcb, struct pbuf* p, err_t
             close(conn->localSock);
             conn->localSock = -1;
         }
+        conn->connected = false;
         return ERR_OK;
     }
 
@@ -659,6 +746,11 @@ void LwipRelay::onTcpError(void* arg, err_t err) {
     TcpConnection* conn = (TcpConnection*)arg;
     if (conn) {
         conn->pcb = nullptr;
+        conn->connected = false;
+        if (conn->localSock >= 0) {
+            close(conn->localSock);
+            conn->localSock = -1;
+        }
     }
     (void)err;
 }

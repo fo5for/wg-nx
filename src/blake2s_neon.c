@@ -1,3 +1,8 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later
+ * Copyright (c) 2026 xlanor
+ * This file is part of wg-nx. See COPYING and COPYING.LESSER.
+ */
+
 #include "blake2s_neon.h"
 
 #if defined(__aarch64__) || defined(__ARM_NEON) || defined(__ARM_NEON__)

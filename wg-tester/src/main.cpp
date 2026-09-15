@@ -1,3 +1,8 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later
+ * Copyright (c) 2026 xlanor
+ * This file is part of wg-nx. See COPYING and COPYING.LESSER.
+ */
+
 #include <borealis.hpp>
 #include <cstdlib>
 #include <cstring>
@@ -251,6 +256,40 @@ static void test_wg_init() {
     }
 
     results.push_back({"WG Init/Close", ok});
+}
+
+static void test_wg_mtu() {
+    uint8_t priv[32], pub[32], peer_priv[32], peer_pub[32];
+    wg_generate_keypair(priv, pub);
+    wg_generate_keypair(peer_priv, peer_pub);
+
+    WgConfig config = {};
+    memcpy(config.private_key, priv, 32);
+    memcpy(config.peer_public_key, peer_pub, 32);
+    config.tunnel_ip.s_addr = inet_addr("10.0.0.2");
+    strncpy(config.endpoint_host, "127.0.0.1", sizeof(config.endpoint_host));
+    config.endpoint_port = 51820;
+
+    WgTunnel* tun = wg_init(&config);
+    bool ok = tun && wg_get_mtu(tun) == WG_DEFAULT_MTU;
+    if (tun) wg_close(tun);
+
+    config.mtu = 1280;
+    tun = wg_init(&config);
+    ok = ok && tun && wg_get_mtu(tun) == 1280;
+    if (tun) wg_close(tun);
+
+    config.mtu = WG_MIN_MTU - 1;
+    tun = wg_init(&config);
+    ok = ok && !tun;
+    if (tun) wg_close(tun);
+
+    config.mtu = WG_MAX_MTU + 1;
+    tun = wg_init(&config);
+    ok = ok && !tun;
+    if (tun) wg_close(tun);
+
+    results.push_back({"WG Config MTU", ok});
 }
 
 static void test_relay() {
@@ -1585,6 +1624,7 @@ static void run_all_tests() {
     test_keypair();
     test_thread_create();
     test_wg_init();
+    test_wg_mtu();
     test_relay();
     test_lwip_relay();
     test_udp_send();

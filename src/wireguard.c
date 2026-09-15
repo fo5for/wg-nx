@@ -1,3 +1,8 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later
+ * Copyright (c) 2026 xlanor
+ * This file is part of wg-nx. See COPYING and COPYING.LESSER.
+ */
+
 #include "wg_internal.h"
 #include <stdlib.h>
 #include <string.h>
@@ -5,9 +10,9 @@
 #include <stdarg.h>
 #include <arpa/inet.h>
 
-#define WG_MAX_PACKET_SIZE 2048
-
 _Static_assert(WG_MAX_PACKET_SIZE <= WG_RECV_SLOT_CAP, "slot capacity too small");
+_Static_assert(sizeof(WgTransport) + WG_AEAD_TAG_LEN == WG_MAX_PACKET_SIZE - WG_MAX_MTU,
+               "maximum MTU must match WireGuard transport overhead");
 
 int wg_recv_pool_init(WgRecvPool* pool) {
     if (!pool) return -1;
@@ -92,6 +97,8 @@ int wg_resolve_endpoint(WgTunnel* tun, const char* host, uint16_t port);
 WgTunnel* wg_init(const WgConfig* config) {
     if (!config)
         return NULL;
+    if (config->mtu && (config->mtu < WG_MIN_MTU || config->mtu > WG_MAX_MTU))
+        return NULL;
 
     WgTunnel* tun = calloc(1, sizeof(WgTunnel));
     if (!tun)
@@ -102,6 +109,7 @@ WgTunnel* wg_init(const WgConfig* config) {
     memcpy(tun->peer_public, config->peer_public_key, WG_KEY_LEN);
     tun->tunnel_ip = config->tunnel_ip;
     tun->keepalive_interval = config->keepalive_interval;
+    tun->mtu = config->mtu ? config->mtu : WG_DEFAULT_MTU;
 
     if (config->has_preshared_key) {
         memcpy(tun->preshared_key, config->preshared_key, WG_KEY_LEN);
@@ -373,7 +381,7 @@ static void* recv_thread_func(void* arg) {
     WgTunnel* tun = (WgTunnel*)arg;
     wg_thread_set_affinity(WG_THREAD_NAME_RECV);
     uint64_t total_recv = 0;
-    uint64_t last_log = 0;
+    uint64_t last_log = wg_time_now();
     static uint8_t fallback_packet[WG_MAX_PACKET_SIZE];
 
     wg_log("recv thread started");
@@ -388,7 +396,7 @@ static void* recv_thread_func(void* arg) {
             if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
             if (received == WG_ERR_TIMEOUT) {
                 uint64_t now = wg_time_now();
-                if (now - last_log > 5000000000ULL) {
+                if (now - last_log >= 5000000000ULL) {
                     wg_log("recv: total=%llu idx=%08x", (unsigned long long)total_recv, tun->session.local_index);
                     last_log = now;
                 }
@@ -400,6 +408,16 @@ static void* recv_thread_func(void* arg) {
 
         total_recv++;
 
+        /* Keep packet-level debug useful without formatting and queuing a log
+         * message for every encrypted transport packet during a stream. */
+        if ((total_recv & 127ULL) == 0) {
+            uint64_t now = wg_time_now();
+            if (now - last_log >= 5000000000ULL) {
+                wg_log("recv: total=%llu idx=%08x", (unsigned long long)total_recv, tun->session.local_index);
+                last_log = now;
+            }
+        }
+
         if ((size_t)received < sizeof(WgTransport) + WG_AEAD_TAG_LEN) {
             wg_log("recv: pkt too small (%d)", received);
             if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
@@ -407,8 +425,6 @@ static void* recv_thread_func(void* arg) {
         }
 
         WgTransport* transport = (WgTransport*)packet;
-        wg_log("recv: type=%d size=%d rekey=%d", transport->type, received, tun->session.rekey_in_progress);
-
         if (transport->type != WG_MSG_TRANSPORT) {
             if (transport->type == WG_MSG_HANDSHAKE_RESPONSE && tun->session.rekey_in_progress) {
                 wg_log("recv: handshake_response rekey=%d", tun->session.rekey_in_progress);
@@ -619,6 +635,9 @@ int wg_send(WgTunnel* tun, const void* data, size_t len) {
     if (!tun || !tun->session.valid)
         return WG_ERR_NOT_CONNECTED;
 
+    if (len > tun->mtu)
+        return WG_ERR_BUFFER_TOO_SMALL;
+
     if (wg_session_expired(tun))
         return WG_ERR_NOT_CONNECTED;
 
@@ -699,6 +718,10 @@ int wg_get_ip(WgTunnel* tun, struct in_addr* addr) {
         return WG_ERR_INVALID_CONFIG;
     *addr = tun->tunnel_ip;
     return WG_OK;
+}
+
+uint16_t wg_get_mtu(WgTunnel* tun) {
+    return tun ? tun->mtu : 0;
 }
 
 void wg_close(WgTunnel* tun) {

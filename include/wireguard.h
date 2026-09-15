@@ -1,3 +1,8 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later
+ * Copyright (c) 2026 xlanor
+ * This file is part of wg-nx. See COPYING and COPYING.LESSER.
+ */
+
 #ifndef WIREGUARD_H
 #define WIREGUARD_H
 
@@ -7,6 +12,11 @@
 
 #define WG_KEY_LEN 32
 #define WG_MAX_ENDPOINT 256
+#define WG_DEFAULT_MTU 1420
+#define WG_MIN_MTU 576
+#define WG_MAX_PACKET_SIZE 2048
+/* Transport header (16 bytes) and authentication tag (16 bytes). */
+#define WG_MAX_MTU (WG_MAX_PACKET_SIZE - 32)
 
 typedef enum {
     WG_OK = 0,
@@ -28,6 +38,7 @@ typedef struct {
     char endpoint_host[WG_MAX_ENDPOINT];
     uint16_t endpoint_port;
     uint16_t keepalive_interval;
+    uint16_t mtu; /* Inner IP MTU; zero uses WG_DEFAULT_MTU. */
     uint8_t preshared_key[WG_KEY_LEN];
     int has_preshared_key;
 } WgConfig;
@@ -51,6 +62,7 @@ void wg_stop(WgTunnel* tun);
 int wg_send(WgTunnel* tun, const void* data, size_t len);
 int wg_recv(WgTunnel* tun, void* buf, size_t len, int timeout_ms);
 int wg_get_ip(WgTunnel* tun, struct in_addr* addr);
+uint16_t wg_get_mtu(WgTunnel* tun);
 void wg_close(WgTunnel* tun);
 
 int wg_key_from_base64(uint8_t key[WG_KEY_LEN], const char* base64);

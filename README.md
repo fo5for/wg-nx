@@ -5,6 +5,13 @@ This is a personal project, and as such, I will most likely not provide any supp
 
 Userland WireGuard library for Nintendo Switch.
 
+## License
+
+Original wg-nx code is `LGPL-3.0-or-later`. See [LICENSE.md](LICENSE.md),
+[COPYING.LESSER](COPYING.LESSER), and [COPYING](COPYING). Vendored Monocypher
+and the Git submodules keep their own licenses; the LGPL notice does not
+replace them.
+
 ![tester](readme/wg-nx.jpg)
 
 ## Cryptography
