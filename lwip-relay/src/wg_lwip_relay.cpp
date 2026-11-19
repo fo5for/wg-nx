@@ -26,11 +26,14 @@ namespace wgnx {
 
 static constexpr size_t LOG_BUFFER_SIZE = 512;
 
+namespace {
+std::once_flag lwipInitOnce;
+}
+
 LwipRelay::LwipRelay(WgTunnel* tunnel, const LwipRelayConfig& config)
     : tunnel_(tunnel)
     , config_(config)
-    , running_(false)
-    , initialized_(false) {
+    , running_(false) {
     memset(&netif_, 0, sizeof(netif_));
     memset(&tunnelAddr_, 0, sizeof(tunnelAddr_));
     memset(&targetAddr_, 0, sizeof(targetAddr_));
@@ -84,10 +87,9 @@ bool LwipRelay::start(const std::string& tunnelIp, const std::string& targetIp) 
         return false;
     }
 
-    if (!initialized_) {
+    std::call_once(lwipInitOnce, [] {
         lwip_init();
-        initialized_ = true;
-    }
+    });
 
     if (inet_pton(AF_INET, tunnelIp.c_str(), &tunnelAddr_) != 1) {
         log(LogLevel::Error, "LwipRelay: invalid tunnel IP: %s", tunnelIp.c_str());

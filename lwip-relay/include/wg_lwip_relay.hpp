@@ -140,7 +140,6 @@ private:
     uint64_t debugUdpPackets_ = 0;
     uint64_t debugUdpBytes_ = 0;
 
-    bool initialized_;
 };
 
 }
