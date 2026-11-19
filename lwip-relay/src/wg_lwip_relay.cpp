@@ -531,8 +531,15 @@ void LwipRelay::pollTcpConnections() {
                 if (received == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
                     log(LogLevel::Info, "LwipRelay: local socket closed");
                     if (conn->pcb) {
-                        tcp_close(conn->pcb);
+                        /* tcp_close() leaves established PCBs alive while the
+                         * FIN handshake completes. Its callbacks still carry
+                         * conn.get() as their argument, but this path removes
+                         * the connection from tcpConnections_ below. Abort it
+                         * instead so lwIP releases the PCB (and invokes the
+                         * error callback) while the map still owns conn. */
+                        struct tcp_pcb* pcb = conn->pcb;
                         conn->pcb = nullptr;
+                        tcp_abort(pcb);
                     }
                     toRemove.push_back(sock);
                 }
